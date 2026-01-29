@@ -2,8 +2,8 @@
 # Deploy PersonaPlex to Google Cloud Compute Engine with GPU
 # Prerequisites: gcloud CLI authenticated, project configured
 #
-# PersonaPlex requires significant GPU memory - L4 (24GB) recommended
-# Uses Spot VM for ~70% cost savings (~$0.21/hr vs ~$0.70/hr for L4)
+# PersonaPlex requires significant GPU memory - A100 80GB recommended
+# Uses Spot VM for ~70% cost savings
 
 set -e
 
@@ -11,10 +11,11 @@ set -e
 PROJECT_ID="${GCP_PROJECT_ID:-$(gcloud config get-value project)}"
 ZONE="${GCP_ZONE:-us-central1-a}"
 INSTANCE_NAME="${INSTANCE_NAME:-personaplex-server}"
-MACHINE_TYPE="${MACHINE_TYPE:-g2-standard-8}"  # g2 for L4 GPU
-GPU_TYPE="${GPU_TYPE:-nvidia-l4}"
-DISK_SIZE="${DISK_SIZE:-200}"  # PersonaPlex models are large
+MACHINE_TYPE="${MACHINE_TYPE:-a2-highgpu-1g}"  # A100 40GB
+GPU_TYPE="${GPU_TYPE:-nvidia-tesla-a100}"
+DISK_SIZE="${DISK_SIZE:-200}"  # PersonaPlex models are large (~14GB)
 USE_SPOT="${USE_SPOT:-true}"
+HF_TOKEN="${HF_TOKEN:-}"
 
 echo "=== Deploying PersonaPlex to GCP ==="
 echo "Project: $PROJECT_ID"
@@ -25,11 +26,17 @@ echo "Disk: ${DISK_SIZE}GB"
 echo "Spot VM: $USE_SPOT"
 echo ""
 
+if [ -z "$HF_TOKEN" ]; then
+  echo "WARNING: HF_TOKEN not set. You'll need to set it on the instance."
+  echo "  export HF_TOKEN=your_token"
+  echo ""
+fi
+
 # Build spot VM flags
 SPOT_FLAGS=""
 if [ "$USE_SPOT" = "true" ]; then
   SPOT_FLAGS="--provisioning-model=SPOT --instance-termination-action=STOP"
-  echo "Using Spot VM (preemptible) for ~70% cost savings"
+  echo "Using Spot VM (preemptible) for cost savings"
   echo ""
 fi
 
@@ -55,8 +62,8 @@ gcloud compute instances create "$INSTANCE_NAME" \
   --accelerator="type=$GPU_TYPE,count=1" \
   --maintenance-policy=TERMINATE \
   $SPOT_FLAGS \
-  --image-family=ubuntu-2204-lts \
-  --image-project=ubuntu-os-cloud \
+  --image-family=pytorch-latest-gpu \
+  --image-project=deeplearning-platform-release \
   --boot-disk-size="${DISK_SIZE}GB" \
   --boot-disk-type=pd-ssd \
   --scopes=cloud-platform \
@@ -67,206 +74,463 @@ exec > >(tee /var/log/startup-script.log) 2>&1
 echo "=== PersonaPlex Setup Starting ==="
 echo "Time: $(date)"
 
-# Install NVIDIA drivers
-echo "Installing NVIDIA drivers..."
-apt-get update
-apt-get install -y linux-headers-$(uname -r)
-
-# Add NVIDIA driver repository
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
-  sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \
-  tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-# Install NVIDIA driver
-apt-get update
-apt-get install -y nvidia-driver-550 nvidia-container-toolkit
-
-# Install Docker
-echo "Installing Docker..."
-curl -fsSL https://get.docker.com -o get-docker.sh
-sh get-docker.sh
-
-# Configure Docker for NVIDIA
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
-
 # Create app directory
 mkdir -p /opt/personaplex
-mkdir -p /opt/personaplex/models
+cd /opt/personaplex
 
-# Create docker-compose file
-cat > /opt/personaplex/docker-compose.yml << 'COMPOSEEOF'
-version: "3.8"
-services:
-  personaplex:
-    image: nvcr.io/nvidia/nemo:24.01.speech
-    container_name: personaplex
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./models:/models
-      - ./app:/app
-    command: python /app/server.py
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-COMPOSEEOF
+# Install system dependencies
+echo "Installing system dependencies..."
+apt-get update
+apt-get install -y libopus-dev ffmpeg git
 
-# Create the server application
-mkdir -p /opt/personaplex/app
-cat > /opt/personaplex/app/server.py << PYEOF
+# Clone PersonaPlex repository
+echo "Cloning PersonaPlex repository..."
+if [ ! -d "/opt/personaplex/personaplex" ]; then
+  git clone https://github.com/NVIDIA/personaplex.git /opt/personaplex/personaplex
+fi
+
+cd /opt/personaplex/personaplex
+
+# Install Python dependencies
+echo "Installing Python dependencies..."
+pip install --upgrade pip
+pip install ./moshi/.
+pip install fastapi uvicorn python-multipart aiofiles
+
+# Create the API server
+echo "Creating API server..."
+mkdir -p /opt/personaplex/server
+cat > /opt/personaplex/server/main.py << 'SERVEREOF'
 """
-PersonaPlex Server - Speech-to-Speech API
+PersonaPlex API Server
 
-This is a placeholder server. PersonaPlex requires:
-1. Access to NVIDIA NGC for model weights
-2. NeMo framework setup
-3. Specific model checkpoints
-
-For actual deployment, replace with official PersonaPlex implementation.
+Provides REST and WebSocket endpoints for PersonaPlex speech-to-speech model.
 """
 
-import asyncio
+import os
+import sys
 import json
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
-import uvicorn
+import asyncio
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Optional
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="PersonaPlex API")
+import torch
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+# Add personaplex to path
+sys.path.insert(0, "/opt/personaplex/personaplex")
+
+# Global model state
+model_state = {
+    "loaded": False,
+    "lm_gen": None,
+    "mimi": None,
+    "device": None,
+}
+
+VOICE_PROMPTS = [
+    "NATF0", "NATF1", "NATF2", "NATF3",
+    "NATM0", "NATM1", "NATM2", "NATM3",
+    "VARF0", "VARF1", "VARF2", "VARF3", "VARF4",
+    "VARM0", "VARM1", "VARM2", "VARM3", "VARM4",
+]
+
+def load_model():
+    """Load PersonaPlex model."""
+    global model_state
+
+    if model_state["loaded"]:
+        return
+
+    print("Loading PersonaPlex model...")
+
+    try:
+        from moshi.models import loaders
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+
+        # Load model from HuggingFace
+        hf_token = os.environ.get("HF_TOKEN")
+        if not hf_token:
+            raise ValueError("HF_TOKEN environment variable not set")
+
+        mimi, lm_gen = loaders.get_moshi_mimi(
+            "nvidia/personaplex-7b-v1",
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        model_state["mimi"] = mimi
+        model_state["lm_gen"] = lm_gen
+        model_state["device"] = device
+        model_state["loaded"] = True
+
+        print("PersonaPlex model loaded successfully!")
+
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        raise
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load model on startup."""
+    try:
+        load_model()
+    except Exception as e:
+        print(f"Warning: Could not load model on startup: {e}")
+        print("Model will be loaded on first request if HF_TOKEN is set.")
+    yield
+
+app = FastAPI(
+    title="PersonaPlex API",
+    description="Real-time speech-to-speech conversational AI",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "personaplex", "gpu": "available"}
+    """Health check endpoint."""
+    gpu_available = torch.cuda.is_available()
+    gpu_name = torch.cuda.get_device_name(0) if gpu_available else None
+
+    return {
+        "status": "ok",
+        "model": "personaplex-7b-v1",
+        "model_loaded": model_state["loaded"],
+        "gpu_available": gpu_available,
+        "gpu_name": gpu_name,
+    }
 
 @app.get("/v1/models")
 async def list_models():
+    """List available models."""
     return {
         "data": [
-            {"id": "personaplex-v1", "object": "model", "owned_by": "nvidia"}
+            {
+                "id": "personaplex-7b-v1",
+                "object": "model",
+                "owned_by": "nvidia",
+                "permission": [],
+            }
         ]
     }
+
+@app.get("/v1/voices")
+async def list_voices():
+    """List available voice prompts."""
+    return {
+        "voices": VOICE_PROMPTS,
+        "categories": {
+            "natural_female": ["NATF0", "NATF1", "NATF2", "NATF3"],
+            "natural_male": ["NATM0", "NATM1", "NATM2", "NATM3"],
+            "variety_female": ["VARF0", "VARF1", "VARF2", "VARF3", "VARF4"],
+            "variety_male": ["VARM0", "VARM1", "VARM2", "VARM3", "VARM4"],
+        }
+    }
+
+@app.post("/v1/audio/speech")
+async def speech_to_speech(
+    audio: UploadFile = File(...),
+    voice: str = Form(default="NATF2"),
+    text_prompt: str = Form(default="You are a helpful assistant. Answer questions clearly and concisely."),
+    seed: int = Form(default=42),
+):
+    """
+    Process speech input and generate speech response.
+
+    - audio: Input WAV file (24kHz recommended)
+    - voice: Voice prompt (e.g., NATF2, NATM1)
+    - text_prompt: System prompt for the AI persona
+    - seed: Random seed for reproducibility
+    """
+    if not model_state["loaded"]:
+        try:
+            load_model()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Model not loaded: {e}")
+
+    if voice not in VOICE_PROMPTS:
+        raise HTTPException(status_code=400, detail=f"Invalid voice. Choose from: {VOICE_PROMPTS}")
+
+    # Save uploaded audio to temp file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as input_file:
+        content = await audio.read()
+        input_file.write(content)
+        input_path = input_file.name
+
+    # Create output paths
+    output_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    output_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+
+    try:
+        # Run offline inference using the moshi CLI
+        cmd = [
+            "python", "-m", "moshi.offline",
+            "--voice-prompt", f"{voice}.pt",
+            "--text-prompt", text_prompt,
+            "--input-wav", input_path,
+            "--seed", str(seed),
+            "--output-wav", output_wav,
+            "--output-text", output_json,
+        ]
+
+        env = os.environ.copy()
+        result = subprocess.run(
+            cmd,
+            cwd="/opt/personaplex/personaplex",
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Inference failed: {result.stderr}"
+            )
+
+        # Read transcript
+        transcript = {}
+        if os.path.exists(output_json):
+            with open(output_json) as f:
+                transcript = json.load(f)
+
+        # Return audio file
+        return FileResponse(
+            output_wav,
+            media_type="audio/wav",
+            headers={
+                "X-Transcript": json.dumps(transcript),
+            }
+        )
+
+    finally:
+        # Cleanup input file
+        if os.path.exists(input_path):
+            os.unlink(input_path)
 
 @app.websocket("/ws/conversation")
 async def websocket_conversation(websocket: WebSocket):
     """
-    Real-time speech-to-speech conversation endpoint.
+    Real-time WebSocket conversation endpoint.
 
-    Client sends: Raw audio chunks (16kHz, 16-bit PCM)
-    Server sends: Response audio chunks
+    Protocol:
+    1. Client sends config JSON: {"voice": "NATF2", "text_prompt": "..."}
+    2. Client sends audio chunks (raw PCM, 24kHz, 16-bit, mono)
+    3. Server sends back audio chunks and transcripts
     """
     await websocket.accept()
     print("WebSocket connection established")
 
+    config = {
+        "voice": "NATF2",
+        "text_prompt": "You are a helpful assistant.",
+    }
+
     try:
+        # First message should be config
+        first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+        try:
+            config = json.loads(first_msg)
+            print(f"Config received: {config}")
+            await websocket.send_text(json.dumps({"type": "config_ack", "config": config}))
+        except json.JSONDecodeError:
+            await websocket.send_text(json.dumps({"type": "error", "message": "First message must be JSON config"}))
+            return
+
+        # For now, use offline mode for each turn
+        # TODO: Implement streaming with moshi.server integration
+
+        audio_buffer = bytearray()
+        silence_counter = 0
+        SILENCE_THRESHOLD = 500  # bytes of near-silence to trigger processing
+
         while True:
-            # Receive audio data
-            data = await websocket.receive_bytes()
-            print(f"Received {len(data)} bytes of audio")
+            try:
+                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
+                audio_buffer.extend(data)
 
-            # TODO: Process with PersonaPlex model
-            # 1. Run ASR to get text
-            # 2. Generate response with LLM
-            # 3. Synthesize speech with TTS
-            # 4. Send audio back
+                # Simple VAD: check if we have enough audio and detect silence
+                if len(audio_buffer) > 48000:  # ~1 second at 24kHz 16-bit
+                    # Check last chunk for silence
+                    last_chunk = audio_buffer[-1024:]
+                    avg_amplitude = sum(abs(b - 128) for b in last_chunk) / len(last_chunk)
 
-            # For now, echo back a placeholder response
-            await websocket.send_text(json.dumps({
-                "type": "transcript",
-                "text": "[Speech recognition placeholder]"
-            }))
+                    if avg_amplitude < 10:  # Near silence
+                        silence_counter += 1
+                    else:
+                        silence_counter = 0
+
+                    # If enough silence, process the audio
+                    if silence_counter > 3:
+                        await websocket.send_text(json.dumps({"type": "processing"}))
+
+                        # Save audio to temp file and process
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                            # Write WAV header
+                            import struct
+                            sample_rate = 24000
+                            num_channels = 1
+                            bits_per_sample = 16
+                            data_size = len(audio_buffer)
+
+                            f.write(b'RIFF')
+                            f.write(struct.pack('<I', 36 + data_size))
+                            f.write(b'WAVE')
+                            f.write(b'fmt ')
+                            f.write(struct.pack('<I', 16))
+                            f.write(struct.pack('<H', 1))
+                            f.write(struct.pack('<H', num_channels))
+                            f.write(struct.pack('<I', sample_rate))
+                            f.write(struct.pack('<I', sample_rate * num_channels * bits_per_sample // 8))
+                            f.write(struct.pack('<H', num_channels * bits_per_sample // 8))
+                            f.write(struct.pack('<H', bits_per_sample))
+                            f.write(b'data')
+                            f.write(struct.pack('<I', data_size))
+                            f.write(bytes(audio_buffer))
+                            input_path = f.name
+
+                        output_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                        output_json = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+
+                        try:
+                            cmd = [
+                                "python", "-m", "moshi.offline",
+                                "--voice-prompt", f"{config.get('voice', 'NATF2')}.pt",
+                                "--text-prompt", config.get("text_prompt", "You are helpful."),
+                                "--input-wav", input_path,
+                                "--output-wav", output_wav,
+                                "--output-text", output_json,
+                            ]
+
+                            result = subprocess.run(
+                                cmd,
+                                cwd="/opt/personaplex/personaplex",
+                                capture_output=True,
+                                text=True,
+                                timeout=60,
+                            )
+
+                            if result.returncode == 0 and os.path.exists(output_wav):
+                                # Send transcript
+                                if os.path.exists(output_json):
+                                    with open(output_json) as f:
+                                        transcript = json.load(f)
+                                    await websocket.send_text(json.dumps({
+                                        "type": "transcript",
+                                        "data": transcript
+                                    }))
+
+                                # Send audio
+                                with open(output_wav, "rb") as f:
+                                    audio_data = f.read()
+                                await websocket.send_bytes(audio_data)
+                                await websocket.send_text(json.dumps({"type": "done"}))
+                            else:
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": result.stderr or "Processing failed"
+                                }))
+                        finally:
+                            for f in [input_path, output_wav, output_json]:
+                                if os.path.exists(f):
+                                    os.unlink(f)
+
+                        # Reset buffer
+                        audio_buffer = bytearray()
+                        silence_counter = 0
+
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "ping"}))
 
     except WebSocketDisconnect:
         print("WebSocket disconnected")
-
-@app.post("/v1/audio/speech")
-async def text_to_speech(request: dict):
-    """
-    OpenAI-compatible TTS endpoint.
-    """
-    text = request.get("input", "")
-    voice = request.get("voice", "alloy")
-
-    # TODO: Implement TTS with PersonaPlex
-    # For now, return error indicating not implemented
-    return JSONResponse(
-        status_code=501,
-        content={"error": "TTS not yet implemented. Use WebSocket for full speech-to-speech."}
-    )
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except:
+            pass
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-PYEOF
+SERVEREOF
 
-# Create requirements file
-cat > /opt/personaplex/app/requirements.txt << REQEOF
-fastapi>=0.104.0
-uvicorn>=0.24.0
-websockets>=12.0
-numpy>=1.24.0
-REQEOF
-
-# Create a simple start script
-cat > /opt/personaplex/start.sh << STARTEOF
+# Create start script
+cat > /opt/personaplex/start.sh << 'STARTSCRIPT'
 #!/bin/bash
 cd /opt/personaplex
 
-# Stop any existing container
-docker rm -f personaplex-placeholder 2>/dev/null || true
-
-# Check if using full PersonaPlex or placeholder
-if [ -f /opt/personaplex/models/personaplex/model.nemo ]; then
-  echo "Starting full PersonaPlex server..."
-  docker compose up -d
-else
-  echo "PersonaPlex model not found. Starting placeholder server..."
-  # Run simple placeholder server (no GPU needed for placeholder)
-  docker run -d --name personaplex-placeholder \
-    -p 8000:8000 \
-    -v /opt/personaplex/app:/app \
-    -w /app \
-    python:3.11-slim \
-    bash -c "pip install --no-cache-dir fastapi uvicorn websockets && python server.py"
+# Check for HF_TOKEN
+if [ -z "$HF_TOKEN" ]; then
+    echo "ERROR: HF_TOKEN environment variable not set"
+    echo "Please run: export HF_TOKEN=your_huggingface_token"
+    echo "You need to accept the license at https://huggingface.co/nvidia/personaplex-7b-v1"
+    exit 1
 fi
-STARTEOF
+
+# Activate conda environment if available
+if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
+    source /opt/conda/etc/profile.d/conda.sh
+    conda activate base
+fi
+
+# Start the API server
+echo "Starting PersonaPlex API server..."
+cd /opt/personaplex/server
+python main.py
+STARTSCRIPT
 chmod +x /opt/personaplex/start.sh
 
-# Create systemd service for auto-start after reboot
-cat > /etc/systemd/system/personaplex.service << SVCEOF
+# Create systemd service
+cat > /etc/systemd/system/personaplex.service << 'SVCFILE'
 [Unit]
-Description=PersonaPlex Server
-After=docker.service
-Requires=docker.service
+Description=PersonaPlex API Server
+After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
+User=root
+WorkingDirectory=/opt/personaplex/server
+Environment="HF_TOKEN="
 ExecStart=/opt/personaplex/start.sh
-ExecStop=/usr/bin/docker stop personaplex-placeholder
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+SVCFILE
 
 systemctl daemon-reload
-systemctl enable personaplex.service
 
-echo "=== Waiting for NVIDIA driver to be ready ==="
-# Wait for driver installation to complete
-sleep 30
-
-# Reboot to load NVIDIA driver
-echo "Rebooting to load NVIDIA driver..."
-reboot
+echo "=== PersonaPlex Setup Complete ==="
+echo ""
+echo "To start the server:"
+echo "  1. Set your HuggingFace token: export HF_TOKEN=your_token"
+echo "  2. Run: /opt/personaplex/start.sh"
+echo ""
+echo "Or configure systemd service:"
+echo "  1. Edit /etc/systemd/system/personaplex.service"
+echo "  2. Set Environment=\"HF_TOKEN=your_token\""
+echo "  3. systemctl start personaplex"
+echo ""
 '
 
 # Create firewall rule if it does not exist
@@ -292,11 +556,11 @@ echo ""
 echo "=== Deployment initiated ==="
 echo ""
 echo "The instance will:"
-echo "  1. Install NVIDIA drivers (~5 min)"
-echo "  2. Reboot to load drivers"
-echo "  3. Auto-start placeholder server (via systemd)"
+echo "  1. Install dependencies (~5 min)"
+echo "  2. Clone PersonaPlex repository"
+echo "  3. Set up API server"
 echo ""
-echo "Total setup time: ~10 minutes"
+echo "Total setup time: ~10-15 minutes"
 echo ""
 
 # Wait a moment for instance to be accessible
@@ -317,11 +581,8 @@ echo ""
 echo "  # Check startup logs"
 echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --command='tail -f /var/log/startup-script.log'"
 echo ""
-echo "  # Check GPU status (after reboot)"
-echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --command='nvidia-smi'"
-echo ""
-echo "  # Check server logs (auto-starts after reboot)"
-echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --command='docker logs personaplex-placeholder -f'"
+echo "  # Set HF token and start server"
+echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --command='export HF_TOKEN=your_token && /opt/personaplex/start.sh'"
 echo ""
 echo "Once ready, test at:"
 echo "  curl http://$EXTERNAL_IP:8000/health"

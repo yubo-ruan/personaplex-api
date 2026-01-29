@@ -1,121 +1,188 @@
 # PersonaPlex API
 
-Self-hosted PersonaPlex speech-to-speech model on GCP with GPU support.
+Self-hosted [PersonaPlex](https://huggingface.co/nvidia/personaplex-7b-v1) speech-to-speech model API on GCP with GPU support.
 
 ## Overview
 
-PersonaPlex is NVIDIA's real-time speech-to-speech conversational AI model. This repository provides deployment scripts for running PersonaPlex on Google Cloud Platform with GPU acceleration.
+PersonaPlex is NVIDIA's real-time, full-duplex speech-to-speech conversational AI model. It enables natural conversations with persona control through text-based role prompts and audio-based voice conditioning.
 
-**Note:** PersonaPlex currently only supports English. No Chinese or Japanese fine-tuned versions exist.
+**Key Features:**
+- Real-time speech-to-speech conversation
+- 18 voice presets (natural and variety voices)
+- Custom persona prompts
+- WebSocket API for streaming
+- REST API for batch processing
 
-## Requirements
-
-- Google Cloud Platform account with GPU quota
-- `gcloud` CLI installed and authenticated
-- GPU: NVIDIA L4 or better (L4 recommended for cost/performance)
+**Requirements:**
+- NVIDIA A100 GPU (40GB+ VRAM recommended)
+- HuggingFace account with accepted [NVIDIA Open Model License](https://huggingface.co/nvidia/personaplex-7b-v1)
 
 ## Quick Start
 
-### 1. Deploy to GCP
+### 1. Accept the License
+
+Visit [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1) and accept the license agreement.
+
+### 2. Get HuggingFace Token
+
+Create a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+
+### 3. Deploy to GCP
 
 ```bash
-# Deploy with default settings (L4 GPU, Spot VM)
+# Set your HuggingFace token
+export HF_TOKEN=your_huggingface_token
+
+# Deploy with default settings (A100 GPU, Spot VM)
 ./scripts/deploy-gcp.sh
 
 # Or customize deployment
-ZONE=us-west1-a GPU_TYPE=nvidia-l4 ./scripts/deploy-gcp.sh
+ZONE=us-west1-b MACHINE_TYPE=a2-highgpu-1g ./scripts/deploy-gcp.sh
 ```
 
-### 2. Test the API
+### 4. Start the Server
 
 ```bash
-# Get external IP
-gcloud compute instances describe personaplex-server --zone=us-central1-a --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
+# SSH into the instance
+gcloud compute ssh personaplex-server --zone=us-central1-a
 
-# Test health endpoint
+# Set token and start server
+export HF_TOKEN=your_token
+/opt/personaplex/start.sh
+```
+
+### 5. Test the API
+
+```bash
+# Health check
 curl http://<EXTERNAL_IP>:8000/health
 
-# Test speech-to-speech (WebSocket)
-# See examples/websocket-client.py
+# List voices
+curl http://<EXTERNAL_IP>:8000/v1/voices
+
+# Speech-to-speech (REST)
+curl -X POST http://<EXTERNAL_IP>:8000/v1/audio/speech \
+  -F "audio=@input.wav" \
+  -F "voice=NATF2" \
+  -F "text_prompt=You are a helpful assistant." \
+  --output response.wav
 ```
 
-## API Endpoints
+## API Reference
 
-### WebSocket: `/ws/conversation`
+### Health Check
 
-Real-time bidirectional speech conversation.
-
-```javascript
-const ws = new WebSocket('ws://<host>:8000/ws/conversation');
-
-// Send audio chunks (16kHz, 16-bit PCM)
-ws.send(audioChunk);
-
-// Receive audio responses
-ws.onmessage = (event) => {
-  playAudio(event.data);
-};
+```
+GET /health
 ```
 
-### REST: `/v1/audio/speech` (TTS only)
+Returns server status and GPU info.
 
-OpenAI-compatible text-to-speech endpoint.
+### List Voices
 
-```bash
-curl -X POST http://<host>:8000/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"input": "Hello world", "voice": "alloy"}' \
-  --output speech.wav
 ```
+GET /v1/voices
+```
+
+Returns available voice presets:
+- **Natural Female**: NATF0, NATF1, NATF2, NATF3
+- **Natural Male**: NATM0, NATM1, NATM2, NATM3
+- **Variety Female**: VARF0, VARF1, VARF2, VARF3, VARF4
+- **Variety Male**: VARM0, VARM1, VARM2, VARM3, VARM4
+
+### Speech-to-Speech (REST)
+
+```
+POST /v1/audio/speech
+Content-Type: multipart/form-data
+```
+
+**Parameters:**
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| audio | file | required | Input WAV file (24kHz recommended) |
+| voice | string | NATF2 | Voice preset |
+| text_prompt | string | "You are a helpful assistant..." | System prompt |
+| seed | int | 42 | Random seed |
+
+**Response:** WAV audio file with `X-Transcript` header containing JSON transcript.
+
+### WebSocket Conversation
+
+```
+WS /ws/conversation
+```
+
+**Protocol:**
+1. Connect to WebSocket
+2. Send config JSON: `{"voice": "NATF2", "text_prompt": "..."}`
+3. Send raw PCM audio chunks (24kHz, 16-bit, mono)
+4. Receive responses:
+   - `{"type": "processing"}` - Processing started
+   - `{"type": "transcript", "data": {...}}` - Transcript
+   - Binary data - Response audio
+   - `{"type": "done"}` - Turn complete
+
+## Example Prompts
+
+**QA Assistant:**
+```
+You are a wise and friendly teacher. Answer questions or provide advice clearly.
+```
+
+**Casual Conversation:**
+```
+You enjoy having a good conversation.
+```
+
+**Customer Service:**
+```
+You work for CitySan Services (waste management). Your name is Ayelen Lucero.
+You need to verify customer Omar Torres before proceeding with their request.
+```
+
+## Python Client Example
+
+```python
+import requests
+
+# Speech-to-speech
+with open("input.wav", "rb") as f:
+    response = requests.post(
+        "http://your-server:8000/v1/audio/speech",
+        files={"audio": f},
+        data={
+            "voice": "NATF2",
+            "text_prompt": "You are a helpful assistant.",
+        }
+    )
+
+if response.ok:
+    with open("output.wav", "wb") as f:
+        f.write(response.content)
+    print("Transcript:", response.headers.get("X-Transcript"))
+```
+
+See [examples/](examples/) for more client examples.
 
 ## Configuration
 
-Environment variables for deployment:
-
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `HF_TOKEN` | required | HuggingFace token |
 | `GCP_PROJECT_ID` | (from gcloud) | GCP project ID |
-| `GCP_ZONE` | `us-central1-a` | Deployment zone |
-| `INSTANCE_NAME` | `personaplex-server` | VM instance name |
-| `MACHINE_TYPE` | `g2-standard-8` | Machine type (g2 for L4) |
-| `GPU_TYPE` | `nvidia-l4` | GPU type |
-| `USE_SPOT` | `true` | Use Spot VM for savings |
+| `GCP_ZONE` | us-central1-a | Deployment zone |
+| `INSTANCE_NAME` | personaplex-server | VM instance name |
+| `MACHINE_TYPE` | a2-highgpu-1g | Machine type |
+| `GPU_TYPE` | nvidia-tesla-a100 | GPU type |
+| `USE_SPOT` | true | Use Spot VM |
 
 ## Cost Estimates
 
-Using Spot VMs for ~70% cost savings:
-
 | GPU | On-Demand | Spot | Notes |
 |-----|-----------|------|-------|
-| L4 | ~$0.70/hr | ~$0.21/hr | Recommended |
-| T4 | ~$0.35/hr | ~$0.11/hr | Budget option |
-| A100 | ~$3.67/hr | ~$1.10/hr | High performance |
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│              GCP VM (g2-standard-8)      │
-│  ┌─────────────────────────────────────┐ │
-│  │         PersonaPlex Server          │ │
-│  │  ┌─────────┐      ┌─────────────┐  │ │
-│  │  │ ASR     │ ──── │ LLM         │  │ │
-│  │  │ (Speech │      │ (Response   │  │ │
-│  │  │  Input) │      │  Generation)│  │ │
-│  │  └─────────┘      └─────────────┘  │ │
-│  │       │                  │         │ │
-│  │       └──────┬───────────┘         │ │
-│  │              ▼                     │ │
-│  │        ┌─────────┐                 │ │
-│  │        │ TTS     │                 │ │
-│  │        │ (Speech │                 │ │
-│  │        │  Output)│                 │ │
-│  │        └─────────┘                 │ │
-│  └─────────────────────────────────────┘ │
-│                 │                        │
-│            NVIDIA L4 GPU                 │
-└─────────────────────────────────────────┘
-```
+| A100 40GB | ~$3.67/hr | ~$1.10/hr | Recommended |
+| A100 80GB | ~$4.89/hr | ~$1.47/hr | Better for long contexts |
 
 ## Monitoring
 
@@ -124,22 +191,33 @@ Using Spot VMs for ~70% cost savings:
 gcloud compute ssh personaplex-server --zone=us-central1-a
 
 # Check logs
-docker logs personaplex -f
+tail -f /var/log/startup-script.log
 
 # Check GPU utilization
 nvidia-smi -l 1
+
+# Check server logs
+journalctl -u personaplex -f
 ```
 
 ## Stopping/Starting
 
 ```bash
 # Stop instance (saves cost)
-gcloud compute instances stop personaplex-server --zone=us-central1-a
+./scripts/stop-instance.sh
 
 # Start instance
-gcloud compute instances start personaplex-server --zone=us-central1-a
+./scripts/start-instance.sh
 ```
+
+## References
+
+- [PersonaPlex on HuggingFace](https://huggingface.co/nvidia/personaplex-7b-v1)
+- [PersonaPlex GitHub](https://github.com/NVIDIA/personaplex)
+- [NVIDIA Research Page](https://research.nvidia.com/labs/adlr/personaplex/)
+- [PersonaPlex Paper](https://research.nvidia.com/labs/adlr/files/personaplex/personaplex_preprint.pdf)
 
 ## License
 
-MIT
+Code: MIT
+Model: [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/)
