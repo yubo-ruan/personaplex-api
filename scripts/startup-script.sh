@@ -159,7 +159,7 @@ async def speech_to_speech(
 
     try:
         cmd = [
-            "python", "-m", "moshi.offline",
+            "python3", "-m", "moshi.offline",
             "--voice-prompt", f"{voice}.pt",
             "--text-prompt", text_prompt,
             "--input-wav", input_path,
@@ -263,7 +263,7 @@ async def websocket_conversation(websocket: WebSocket):
 
                         try:
                             cmd = [
-                                "python", "-m", "moshi.offline",
+                                "python3", "-m", "moshi.offline",
                                 "--voice-prompt", f"{config.get('voice', 'NATF2')}.pt",
                                 "--text-prompt", config.get("text_prompt", "You are helpful."),
                                 "--input-wav", input_path,
