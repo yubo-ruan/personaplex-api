@@ -94,9 +94,10 @@ systemctl restart docker
 
 # Create app directory
 mkdir -p /opt/personaplex
+mkdir -p /opt/personaplex/models
 
 # Create docker-compose file
-cat > /opt/personaplex/docker-compose.yml << EOF
+cat > /opt/personaplex/docker-compose.yml << 'COMPOSEEOF'
 version: "3.8"
 services:
   personaplex:
@@ -119,7 +120,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-EOF
+COMPOSEEOF
 
 # Create the server application
 mkdir -p /opt/personaplex/app
@@ -228,13 +229,13 @@ if [ -f /opt/personaplex/models/personaplex/model.nemo ]; then
   docker compose up -d
 else
   echo "PersonaPlex model not found. Starting placeholder server..."
-  # Run simple placeholder server
+  # Run simple placeholder server (no GPU needed for placeholder)
   docker run -d --name personaplex-placeholder \
-    --gpus all \
     -p 8000:8000 \
     -v /opt/personaplex/app:/app \
+    -w /app \
     python:3.11-slim \
-    bash -c "pip install fastapi uvicorn websockets && python /app/server.py"
+    bash -c "pip install --no-cache-dir fastapi uvicorn websockets && python server.py"
 fi
 STARTEOF
 chmod +x /opt/personaplex/start.sh
