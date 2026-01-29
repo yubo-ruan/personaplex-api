@@ -33,12 +33,21 @@ Create a token at [huggingface.co/settings/tokens](https://huggingface.co/settin
 # Set your HuggingFace token
 export HF_TOKEN=your_huggingface_token
 
-# Deploy with default settings (A100 GPU, Spot VM)
-./scripts/deploy-gcp.sh
+# Option 1: Deploy with L4 GPU (cheaper, ~$0.21/hr Spot)
+GPU_TYPE=l4 ./scripts/deploy-gcp.sh
 
-# Or customize deployment
-ZONE=us-west1-b MACHINE_TYPE=a2-highgpu-1g ./scripts/deploy-gcp.sh
+# Option 2: Deploy with A100 GPU (faster, ~$1.10/hr Spot)
+GPU_TYPE=a100 ./scripts/deploy-gcp.sh
+
+# Option 3: Deploy both to compare
+./scripts/deploy-both.sh
 ```
+
+**GPU Comparison:**
+| GPU | VRAM | Spot Cost | CPU Offload | Performance |
+|-----|------|-----------|-------------|-------------|
+| L4 | 24GB | ~$0.21/hr | Required | Slower but cheaper |
+| A100 | 40GB | ~$1.10/hr | Not needed | Recommended |
 
 ### 4. Start the Server
 
@@ -173,16 +182,15 @@ See [examples/](examples/) for more client examples.
 | `GCP_PROJECT_ID` | (from gcloud) | GCP project ID |
 | `GCP_ZONE` | us-central1-a | Deployment zone |
 | `INSTANCE_NAME` | personaplex-server | VM instance name |
-| `MACHINE_TYPE` | a2-highgpu-1g | Machine type |
-| `GPU_TYPE` | nvidia-tesla-a100 | GPU type |
-| `USE_SPOT` | true | Use Spot VM |
+| `GPU_TYPE` | l4 | GPU type: `l4` or `a100` |
+| `USE_SPOT` | true | Use Spot VM for savings |
 
 ## Cost Estimates
 
-| GPU | On-Demand | Spot | Notes |
-|-----|-----------|------|-------|
-| A100 40GB | ~$3.67/hr | ~$1.10/hr | Recommended |
-| A100 80GB | ~$4.89/hr | ~$1.47/hr | Better for long contexts |
+| GPU | Machine | On-Demand | Spot | Notes |
+|-----|---------|-----------|------|-------|
+| L4 24GB | g2-standard-8 | ~$0.70/hr | ~$0.21/hr | Budget option, needs CPU offload |
+| A100 40GB | a2-highgpu-1g | ~$3.67/hr | ~$1.10/hr | Recommended |
 
 ## Monitoring
 
