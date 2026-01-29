@@ -219,8 +219,11 @@ cat > /opt/personaplex/start.sh << STARTEOF
 #!/bin/bash
 cd /opt/personaplex
 
+# Stop any existing container
+docker rm -f personaplex-placeholder 2>/dev/null || true
+
 # Check if using full PersonaPlex or placeholder
-if [ -f /models/personaplex/model.nemo ]; then
+if [ -f /opt/personaplex/models/personaplex/model.nemo ]; then
   echo "Starting full PersonaPlex server..."
   docker compose up -d
 else
@@ -235,6 +238,26 @@ else
 fi
 STARTEOF
 chmod +x /opt/personaplex/start.sh
+
+# Create systemd service for auto-start after reboot
+cat > /etc/systemd/system/personaplex.service << SVCEOF
+[Unit]
+Description=PersonaPlex Server
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/personaplex/start.sh
+ExecStop=/usr/bin/docker stop personaplex-placeholder
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+systemctl daemon-reload
+systemctl enable personaplex.service
 
 echo "=== Waiting for NVIDIA driver to be ready ==="
 # Wait for driver installation to complete
@@ -270,7 +293,7 @@ echo ""
 echo "The instance will:"
 echo "  1. Install NVIDIA drivers (~5 min)"
 echo "  2. Reboot to load drivers"
-echo "  3. Start placeholder server"
+echo "  3. Auto-start placeholder server (via systemd)"
 echo ""
 echo "Total setup time: ~10 minutes"
 echo ""
@@ -291,13 +314,13 @@ echo "  # SSH into instance"
 echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID"
 echo ""
 echo "  # Check startup logs"
-echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command='tail -f /var/log/startup-script.log'"
+echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --command='tail -f /var/log/startup-script.log'"
 echo ""
 echo "  # Check GPU status (after reboot)"
-echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command='nvidia-smi'"
+echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --command='nvidia-smi'"
 echo ""
-echo "  # Start PersonaPlex server (after setup)"
-echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command='/opt/personaplex/start.sh'"
+echo "  # Check server logs (auto-starts after reboot)"
+echo "  gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --command='docker logs personaplex-placeholder -f'"
 echo ""
 echo "Once ready, test at:"
 echo "  curl http://$EXTERNAL_IP:8000/health"
